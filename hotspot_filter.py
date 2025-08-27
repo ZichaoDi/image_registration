@@ -24,8 +24,8 @@ def detect_hotspots(img: np.ndarray, sigma_factor=2.0):
     thresh_high = min(255, mean + sigma_factor * std_dev)  # Cap at 255
     thresh_low = max(0, mean - sigma_factor * std_dev)  # Cap at 0
 
-    print(f"Mean: {mean:.2f}, Std Dev: {std_dev:.2f}")
-    print(f"Auto-Thresholds → Low: {thresh_low:.2f}, High: {thresh_high:.2f}")
+    # print(f"Mean: {mean:.2f}, Std Dev: {std_dev:.2f}")
+    # print(f"Auto-Thresholds → Low: {thresh_low:.2f}, High: {thresh_high:.2f}")
 
     # Detect bright hotspots
     _, mask_high = cv2.threshold(img, thresh_high, 255, cv2.THRESH_BINARY)
@@ -64,7 +64,7 @@ def remove_hotspots_auto(image: np.ndarray, mask: np.ndarray, method="inpaint"):
 
     elif method == "blur":
         # Apply Gaussian blur only on hotspot areas
-        blurred = cv2.GaussianBlur(image, (3,3), 0)
+        blurred = cv2.GaussianBlur(image, (1,1), 0)
         result_gray = image.copy()
         result_gray[mask == 255] = blurred[mask == 255]
 

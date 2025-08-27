@@ -1,106 +1,14 @@
+import cv2
+import numpy as np
 import os
 import h5py
 import cv2
-import numpy as np
 import matplotlib.pyplot as plt
 plt.ion()
 
 from hotspot_filter import remove_hotspots_auto, detect_hotspots
 from skimage.metrics import normalized_mutual_information
-
-
-def load_image(path, dataset_key=None, channel=None, as_gray=True):
-    """
-    Load either:
-      • A single channel from an HDF5 dataset (shape C×H×W), or
-      • A 2D image file (PNG/JPG/TIFF/etc).
-
-    Returns:
-        img (np.ndarray): 2D image array.
-        element (str|None): channel name (HDF5 only) or None.
-    """
-    ext = os.path.splitext(path)[1].lower()
-
-    if ext in ('.h5', '.hdf5'):
-        if dataset_key is None or channel is None:
-            raise ValueError("HDF5 inputs require dataset_key AND channel")
-        with h5py.File(path, 'r') as f:
-            arr = f[dataset_key][...]              # (C,H,W) or (C,H,W,3)
-            names = f["MAPS/channel_names"][...]   # list of bytes
-        channel_names = [n.decode() for n in names]
-        img = arr[channel]
-        element = channel_names[channel]
-
-        C, H, W = arr.shape
-        fig, axes = plt.subplots(1, C, figsize=(4*C, 4))
-        if C == 1:
-            axes = [axes]  # make it iterable even when there's only one channel
-
-        for i, ax in enumerate(axes):
-            im = arr[i]
-            ax.imshow(im, cmap='gray')
-            ax.set_title(channel_names[i])
-            ax.axis('off')
-
-        plt.tight_layout()
-        plt.show()
-
-        if as_gray and img.ndim == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    else:
-        # image file
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise ValueError(f"Could not load image at {path!r}")
-        element = None
-
-        if as_gray and img.ndim == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    return img, element
-def preprocess_with_canny(img,
-                          low_threshold=0,
-                          high_threshold=150,
-                          gaussian_blur_ksize=(5,5),
-                          gaussian_blur_sigma=1.0):
-    """
-    Preprocess image by:
-      1) Normalizing to uint8
-      2) Gaussian‐blurring to reduce noise
-      3) Running Canny edge detector
-      4) (Optionally) Dilating edges to thicken
-
-    Returns:
-        edge_img (np.ndarray): binary edge map (0 or 255)
-    """
-    # 1) normalize to [0,255] uint8
-    if img.dtype != np.uint8:
-        img = cv2.normalize(img, None, 0, 255,
-                            cv2.NORM_MINMAX).astype(np.uint8)
-
-    # 2) smooth
-    img_blur = cv2.GaussianBlur(img, gaussian_blur_ksize, gaussian_blur_sigma)
-    gx = cv2.Sobel(img, cv2.CV_64F, 1, 0)
-    gy = cv2.Sobel(img, cv2.CV_64F, 0, 1)
-    mag = np.hypot(gx, gy)
-    med = np.median(mag)
-    low_threshold  = 1.66 * med
-    high_threshold = 3.33 * med
-
-    # 3) Canny edges
-    edges = cv2.Canny(img_blur, low_threshold, high_threshold, L2gradient=True)
-
-    # 4) (optional) thicken edges by dilation
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-    edges = cv2.dilate(edges, kernel, iterations=1)
-
-    return edges
-
-
-import cv2
-import numpy as np
-from hotspot_filter import remove_hotspots_auto, detect_hotspots
+from image_module import snr, load_image, rotate_image, center_crop_2d,find_angle
 
 def preprocess(img):
     """
@@ -113,7 +21,9 @@ def preprocess(img):
 
     # 2) remove bright/dark hotspots
     mask = detect_hotspots(img, sigma_factor=3)
-    img = remove_hotspots_auto(img, mask, method="inpaint")
+    img = remove_hotspots_auto(img, mask, method="blur")
+    # import pdb; pdb.set_trace()
+
 
     # 3) robust clipping to [mean–2σ, mean+2σ]
     arr = img.astype(np.float32)
@@ -139,7 +49,7 @@ def draw_matches(img1, kp1, img2, kp2, matches, element=None, top_n=20):
         img1, kp1,
         img2, kp2,
         matches[:top_n], None,
-        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
     )
     plt.figure(figsize=(12, 6))
     plt.imshow(img_m, cmap='gray')
@@ -149,14 +59,6 @@ def draw_matches(img1, kp1, img2, kp2, matches, element=None, top_n=20):
     plt.show()
 
 
-def center_crop_2d(A: np.ndarray, crop_h: int, crop_w: int) -> np.ndarray:
-    H, W = A.shape[:2]
-    if crop_h > H or crop_w > W:
-        raise ValueError("crop size must be ≤ array size")
-    start_i = (H - crop_h) // 2
-    start_j = (W - crop_w) // 2
-    return A[start_i:start_i + crop_h,
-             start_j:start_j + crop_w]
 
 def assign_intensity_centroid_orientation(img: np.ndarray, keypoints, patch_radius=16):
     """
@@ -204,48 +106,52 @@ def register_cropped_region(
     # ── Load & preprocess ──────────────────────────────────────────────────────
     ref_img, ref_element = load_image(img_path_ref, ref_key, channel)
     ref = preprocess(ref_img)
-    # ref = ref[150:350, 200:500]
+    # ref = cv2.resize(ref, None, fx=8, fy=8, interpolation=cv2.INTER_CUBIC)
+
+    # ref = rotate_image(ref, angle=45)
 
     tgt_img, tgt_element = load_image(img_path_tgt, tgt_key, channel)
-    tgt_img = cv2.flip(tgt_img,0)
-    tgt = preprocess(tgt_img)
+    tgt = preprocess(tgt_img[:,:]) #100
+    # import pdb; pdb.set_trace()
+
+    # angle, rot_matrix, aligned = find_angle(tgt, ref[1:1948,1:2048])
+
     ### ── Detect ORB keypoints only ───────────────────────────────────
     ## use a 64×64 patch around each keypoint
-    ## orb = cv2.ORB_create(1000)
-    orb = cv2.ORB_create(
-      nfeatures=1000,
-      patchSize=128,         # ← increase this to cover a larger neighborhood
-      edgeThreshold=32,  # must be >= patchSize/2 + 1
-      scaleFactor=1.2,
-      nlevels=16
-    )
+    # orb = cv2.ORB_create(
+    #   nfeatures=1000,
+    #   patchSize=128,         # ← increase this to cover a larger neighborhood
+    #   edgeThreshold=64,  # must be >= patchSize/2 + 1
+    #   scaleFactor=1.2,
+    #   nlevels=16
+    # )
 
-    kp_ref = orb.detect(ref, None)
-    kp_tgt = orb.detect(tgt, None)
-    # # ── Assign orientation by intensity‐centroid ──────────────────
-    kp_ref = assign_intensity_centroid_orientation(ref, kp_ref)
-    kp_tgt = assign_intensity_centroid_orientation(tgt, kp_tgt)
-    kp_ref, des_ref = orb.compute(ref, kp_ref)
-    kp_tgt, des_tgt = orb.compute(tgt, kp_tgt)
-
-    if des_ref is None or des_tgt is None:
-        raise RuntimeError("No descriptors found in one of the images")
-
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-
-    ####### -------use SIFT -------------------------
-    # sift = cv2.SIFT_create()
-    # kp_ref = sift.detect(ref, None)
-    # kp_tgt = sift.detect(tgt, None)
-    # # ── Assign orientation by intensity‐centroid ──────────────────
+    # kp_ref = orb.detect(ref, None)
+    # kp_tgt = orb.detect(tgt, None)
+    # # # ── Assign orientation by intensity‐centroid ──────────────────
     # kp_ref = assign_intensity_centroid_orientation(ref, kp_ref)
     # kp_tgt = assign_intensity_centroid_orientation(tgt, kp_tgt)
-    # kp_ref, des_ref = sift.compute(ref, kp_ref)
-    # kp_tgt, des_tgt = sift.compute(tgt, kp_tgt)
-    # if des_ref is None or des_tgt is None:
-    #   raise RuntimeError("No descriptors found in one of the images")
+    # kp_ref, des_ref = orb.compute(ref, kp_ref)
+    # kp_tgt, des_tgt = orb.compute(tgt, kp_tgt)
 
-    # bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    # if des_ref is None or des_tgt is None:
+    #     raise RuntimeError("No descriptors found in one of the images")
+
+    # bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    ####### -------use SIFT -------------------------
+    sift = cv2.SIFT_create()
+    kp_ref = sift.detect(ref, None)
+    kp_tgt = sift.detect(tgt, None)
+    # ── Assign orientation by intensity‐centroid ──────────────────
+    kp_ref = assign_intensity_centroid_orientation(ref, kp_ref)
+    kp_tgt = assign_intensity_centroid_orientation(tgt, kp_tgt)
+    kp_ref, des_ref = sift.compute(ref, kp_ref)
+    kp_tgt, des_tgt = sift.compute(tgt, kp_tgt)
+    if des_ref is None or des_tgt is None:
+      raise RuntimeError("No descriptors found in one of the images")
+
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
     ############################################################
     # after you’ve computed des_ref, des_tgt and kp_ref, kp_tgt…
 
@@ -276,9 +182,9 @@ def register_cropped_region(
     pts_ref = np.float32([kp_ref[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
     pts_tgt = np.float32([kp_tgt[m.trainIdx].pt for m in matches]).reshape(-1,1,2)
 
-    draw_matches(ref, kp_ref, tgt, kp_tgt,
-               matches, element=ref_element,
-               top_n=draw_n_matches)
+    # draw_matches(ref, kp_ref, tgt, kp_tgt,
+    #            matches, element=ref_element,
+    #            top_n=draw_n_matches)
 
 
 
@@ -304,11 +210,12 @@ def register_cropped_region(
         warp_fn = cv2.warpPerspective
 
     # ── Warp target into reference frame ───────────────────────────────────────
+    # M = np.load("my_array.npy")
     H_ref, W_ref = ref.shape
     aligned = warp_fn(tgt, M, (W_ref, H_ref))
-    plt.figure()
-    plt.imshow(aligned)
-    plt.show()
+    # plt.figure()
+    # plt.imshow(aligned)
+    # plt.show()
 
 
     # ── Compute error metrics over overlap ────────────────────────────────────
@@ -329,61 +236,21 @@ def register_cropped_region(
     # plt.show()
 
     return aligned, ref, tgt, ref_img, tgt_img, M, err
-def overlay_images(ref, aligned, alpha=0.5, element=None):
-    """
-    Display ref and aligned on the same axes in true grayscale,
-    with the aligned image semi-transparent on top.
-    """
-    # ensure uint8 0–255
-    ref8    = np.clip(ref,    0, 255).astype(np.uint8)
-    aligned8 = np.clip(aligned, 0, 255).astype(np.uint8)
-
-    fig, ax = plt.subplots(figsize=(6,6))
-    # show reference first
-    im_ref = ax.imshow(ref8,    cmap='gray', vmin=0, vmax=255)
-    # overlay aligned with alpha
-    ax.imshow(aligned8, cmap='gray', vmin=0, vmax=255, alpha=alpha)
-
-    ax.axis('off')
-    title = f"{element}: Overlay" if element else "Overlay"
-    ax.set_title(title)
-
-    # one colorbar for the reference intensity scale
-    cbar = fig.colorbar(im_ref, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Pixel intensity (0–255)")
-
-    plt.tight_layout()
-    plt.show()
-
-
-def overlay_images1(ref, aligned, alpha=0.5, element=None):
-    """Blend to see where the small patch landed."""
-    blended = cv2.addWeighted(ref.astype(np.float32), alpha,
-                              aligned.astype(np.float32), 1-alpha, 0)
-    blended = np.clip(blended, 0, 255).astype(np.uint8)
-    plt.figure(figsize=(6,6))
-    plt.imshow(blended, cmap="gray")
-    title = f"{element}: Overlay" if element else "Overlay"
-    plt.title(title)
-    plt.axis("off")
-    plt.show()
-
 
 # — example usage —
 if __name__ == "__main__":
-    h5_a = "../2017_alloy_data/bnp_fly0009.h5"
-    png_b = "../2017_alloy_data/ROI-3/2018011908-5kx-PreSI-2kx2k-20kcps-12hrs-HAADF.png"
-    # h5_a = "../bnp_fly0002.h5"
-    # h5_b = "../bnp_fly0003.h5"
-    channels = [8, 10, 14, 20, 21] #[6,7, 8, 9, 20] # [2, 3, 5, 6, 8, 22] #np.arange(6,9) #
+    h5_a = "../../bnp_fly0002.h5"
+    h5_b = "../../bnp_fly0004.h5"
+    channels =[22] #[4, 5, 6, 15, 22] # np.append(np.arange(4, 16, 1),[22]) #  [2, 3, 5, 6, 8, 22] #np.arange(6,9) #
     # Pre-allocate an array of shape (n_channels, error_dim)
     error_all = np.zeros((len(channels), 4), dtype=float)
+    snr_ratio = np.zeros((len(channels), 1), dtype=float)
     # layout: 2 rows × ceil(n/2) columns (adjust as you like)
     n = len(channels)
     cols = len(channels)  # for 6 channels, 2×3 grid; tweak for your n
-    rows = 2 #int(np.ceil(n/cols))+1
+    rows = 3 #int(np.ceil(n/cols))+1
     fig = plt.figure(figsize=(4*n, 8))
-    gs  = fig.add_gridspec(2, n, height_ratios=[1,1.2], hspace=0.3)
+    gs  = fig.add_gridspec(rows, n, height_ratios=[1,1.2, 1.2], hspace=0.3)
 
 
     for i, ch in enumerate(channels):
@@ -392,17 +259,15 @@ if __name__ == "__main__":
         ax  = fig.add_subplot(gs[row, col])
         # 1) register
         try:
-            # aligned, ref_img, tgt_img, ref_img0, tgt_img0, M, error = register_cropped_region(
-            #   h5_a, "MAPS/XRF_fits",
-            #   h5_b, "MAPS/XRF_fits",
-            #   channel=ch
-            # )
             aligned, ref_img, tgt_img, ref_img0, tgt_img0, M, error = register_cropped_region(
               h5_a, "MAPS/XRF_fits",
-              png_b, None,
+              h5_b, "MAPS/XRF_fits",
               channel=ch
             )
+            print(np.max(ref_img0))
+
             error_all[i] = error
+            snr_ratio[i] = snr(ref_img0)
         except RuntimeError as e:
             print(f"Channel {ch}: {e} — skipping")
             continue    # ← valid here inside the loop
@@ -440,10 +305,13 @@ if __name__ == "__main__":
 
     # 3) Normalize
     A_norm = (A - col_min) / denom
-    ax_err = fig.add_subplot(gs[1, :])  # row = n_rows-1, all columns
+    ax_snr = fig.add_subplot(gs[1, :])  # row = n_rows-1, all columns
+    ax_snr.plot(np.arange(1,n+1),snr_ratio[:], marker='o', linewidth=2)
+    ax_snr.set_ylabel("SNR")
+    ax_err = fig.add_subplot(gs[2, :])  # row = n_rows-1, all columns
 
 # plot only the last two columns of errors
-    ax_err.plot(np.arange(1,n+1),error_all[:, :], marker='o', linewidth=2)
+    ax_err.plot(np.arange(1,n+1),A_norm[:, :], marker='o', linewidth=2)
     ax_err.set_xticks(np.arange(1,n+1))
     ax_err.set_xlabel("Channel index")
     ax_err.set_ylabel("Normalized error")
